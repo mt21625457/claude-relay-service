@@ -56,3 +56,6 @@ Keep this managed block so 'openspec update' can refresh the instructions.
 ## Security & Configuration Tips
 - Initialize config with `make setup`; adjust `config/config.js` and `.env` for local use.
 - Prefer TLS via a reverse proxy in production; if enabling built-in HTTPS, set `server.https.certPath/keyPath` correctly.
+
+## Communication Preference
+- AI 助手在与当前项目用户互动时，应优先使用中文进行交流
