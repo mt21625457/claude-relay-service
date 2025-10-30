@@ -47,7 +47,7 @@ class CostInitService {
    */
   async initializeApiKeyCosts(apiKeyId, client) {
     // 获取所有时间的模型使用统计
-    const modelKeys = await client.keys(`usage:${apiKeyId}:model:*:*:*`)
+    const modelKeys = await redis.keys(`usage:${apiKeyId}:model:*:*:*`)
 
     // 按日期分组统计
     const dailyCosts = new Map() // date -> cost
@@ -154,7 +154,7 @@ class CostInitService {
       const client = redis.getClientSafe()
 
       // 检查是否有任何费用数据
-      const costKeys = await client.keys('usage:cost:*')
+      const costKeys = await redis.keys('usage:cost:*')
 
       // 如果没有费用数据，需要初始化
       if (costKeys.length === 0) {
@@ -163,7 +163,7 @@ class CostInitService {
       }
 
       // 检查是否有使用数据但没有对应的费用数据
-      const sampleKeys = await client.keys('usage:*:model:daily:*:*')
+      const sampleKeys = await redis.keys('usage:*:model:daily:*:*')
       if (sampleKeys.length > 10) {
         // 抽样检查
         const sampleSize = Math.min(10, sampleKeys.length)

@@ -204,6 +204,23 @@ const authenticateApiKey = async (req, res, next) => {
     // 检查并发限制
     const concurrencyLimit = validation.keyData.concurrencyLimit || 0
     if (!skipKeyRestrictions && concurrencyLimit > 0) {
+      // Centralized concurrency freeze during switch window
+      try {
+        if (typeof redis.getConcurrencySwitchState === 'function') {
+          const { freezeActive } = await redis.getConcurrencySwitchState()
+          if (freezeActive) {
+            logger.warn(
+              `🚫 Concurrency frozen (switch in progress). Key ${validation.keyData.id} denied`
+            )
+            return res.status(429).json({
+              error: 'Concurrency temporarily frozen',
+              message: 'System is switching concurrency mode. Try again shortly.'
+            })
+          }
+        }
+      } catch (e) {
+        // Ignore errors to avoid false blocking
+      }
       const { leaseSeconds: configLeaseSeconds, renewIntervalSeconds: configRenewIntervalSeconds } =
         resolveConcurrencyConfig()
       const leaseSeconds = Math.max(Number(configLeaseSeconds) || 300, 30)

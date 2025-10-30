@@ -617,7 +617,7 @@ async function deleteAccount(accountId) {
   }
 
   // 清理会话映射
-  const sessionMappings = await client.keys(`${ACCOUNT_SESSION_MAPPING_PREFIX}*`)
+  const sessionMappings = await redisClient.keys(`${ACCOUNT_SESSION_MAPPING_PREFIX}*`)
   for (const key of sessionMappings) {
     const mappedAccountId = await client.get(key)
     if (mappedAccountId === accountId) {
@@ -632,7 +632,7 @@ async function deleteAccount(accountId) {
 // 获取所有账户
 async function getAllAccounts() {
   const client = redisClient.getClientSafe()
-  const keys = await client.keys(`${GEMINI_ACCOUNT_KEY_PREFIX}*`)
+  const keys = await redisClient.keys(`${GEMINI_ACCOUNT_KEY_PREFIX}*`)
   const accounts = []
 
   for (const key of keys) {

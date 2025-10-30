@@ -52,6 +52,22 @@ class Application {
       await redis.connect()
       logger.success('✅ Redis connected successfully')
 
+      // 🟦 蓝绿切流 / 启动时应用并发集中开关（可选）
+      try {
+        const cc = config.concurrency || {}
+        if (cc.applyOnStartup) {
+          const payload = {
+            mode: (cc.defaultMode || 'zset').toLowerCase(),
+            switchAtMs: Number(cc.switchAtMs) || 0,
+            freezeUntilMs: Number(cc.freezeUntilMs) || 0
+          }
+          await redis.setConcurrencyConfig(payload)
+          logger.info('🟢 Applied startup concurrency config to Redis', payload)
+        }
+      } catch (e) {
+        logger.warn('⚠️ Failed to apply startup concurrency config:', { error: e.message })
+      }
+
       // 💰 初始化价格服务
       logger.info('🔄 Initializing pricing service...')
       await pricingService.initialize()
@@ -349,8 +365,16 @@ class Application {
       this.app.get('/metrics', async (req, res) => {
         try {
           const stats = await redis.getSystemStats()
+          let concurrency = null
+          try {
+            if (typeof redis.getConcurrencySwitchState === 'function') {
+              const state = await redis.getConcurrencySwitchState()
+              concurrency = { mode: state.mode, freezeActive: state.freezeActive }
+            }
+          } catch (_) {}
           const metrics = {
             ...stats,
+            concurrency,
             uptime: process.uptime(),
             memory: process.memoryUsage(),
             timestamp: new Date().toISOString()
@@ -648,51 +672,54 @@ class Application {
     )
 
     // 🔢 启动并发计数自动清理任务（Phase 1 修复：解决并发泄漏问题）
-    // 每分钟主动清理所有过期的并发项，不依赖请求触发
+    // 每分钟使用 SCAN + pipeline 分批清理过期并发项
     setInterval(async () => {
       try {
-        const keys = await redis.keys('concurrency:*')
+        // slots 模式完全依赖键 TTL，无需主动清理
+        try {
+          if (typeof redis.getConcurrencySwitchState === 'function') {
+            const { mode } = await redis.getConcurrencySwitchState()
+            if (mode === 'slots') {
+              return
+            }
+          }
+        } catch (_) {}
+
+        const keys = await redis.scanKeys('concurrency:*', { count: 200 })
         if (keys.length === 0) {
           return
         }
 
         const now = Date.now()
-        let totalCleaned = 0
+        // 第一步：批量清理过期成员 + 获取当前 ZCARD
+        const pipe1 = redis.getClientSafe().pipeline()
+        for (const k of keys) {
+          // 清理过期项
+          pipe1.zremrangebyscore(k, '-inf', now)
+          // 获取剩余计数
+          pipe1.zcard(k)
+        }
+        const res1 = await pipe1.exec()
 
-        // 使用 Lua 脚本批量清理所有过期项
-        for (const key of keys) {
-          try {
-            const cleaned = await redis.client.eval(
-              `
-              local key = KEYS[1]
-              local now = tonumber(ARGV[1])
-
-              -- 清理过期项
-              redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
-
-              -- 获取剩余计数
-              local count = redis.call('ZCARD', key)
-
-              -- 如果计数为0，删除键
-              if count <= 0 then
-                redis.call('DEL', key)
-                return 1
-              end
-
-              return 0
-            `,
-              1,
-              key,
-              now
-            )
-            if (cleaned === 1) {
-              totalCleaned++
-            }
-          } catch (error) {
-            logger.error(`❌ Failed to clean concurrency key ${key}:`, error)
+        // 统计需要删除的空键
+        const toDelete = []
+        for (let i = 0; i < keys.length; i++) {
+          // 每个key两条命令：index 2*i => zremrangebyscore, 2*i+1 => zcard
+          const pairIdx = 2 * i + 1
+          const [, cnt] = res1[pairIdx] || []
+          if (Number(cnt) <= 0) {
+            toDelete.push(keys[i])
           }
         }
 
+        // 第二步：批量删除空键
+        let totalCleaned = 0
+        if (toDelete.length > 0) {
+          const pipe2 = redis.getClientSafe().pipeline()
+          toDelete.forEach((k) => pipe2.del(k))
+          const res2 = await pipe2.exec()
+          totalCleaned = res2.filter(([err, v]) => !err && Number(v) === 1).length
+        }
         if (totalCleaned > 0) {
           logger.info(`🔢 Concurrency cleanup: cleaned ${totalCleaned} expired keys`)
         }

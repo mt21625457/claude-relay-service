@@ -209,7 +209,7 @@ router.post('/api/user-stats', async (req, res) => {
       const client = redis.getClientSafe()
 
       // 获取所有月度模型统计（与model-stats接口相同的逻辑）
-      const allModelKeys = await client.keys(`usage:${keyId}:model:monthly:*:*`)
+      const allModelKeys = await redis.keys(`usage:${keyId}:model:monthly:*:*`)
       const modelUsageMap = new Map()
 
       for (const key of allModelKeys) {
@@ -701,7 +701,7 @@ router.post('/api/batch-model-stats', async (req, res) => {
             ? `usage:${apiId}:model:daily:*:${today}`
             : `usage:${apiId}:model:monthly:*:${currentMonth}`
 
-        const keys = await client.keys(pattern)
+        const keys = await redis.keys(pattern)
 
         for (const key of keys) {
           const match = key.match(
@@ -875,7 +875,7 @@ router.post('/api/user-model-stats', async (req, res) => {
         ? `usage:${keyId}:model:daily:*:${today}`
         : `usage:${keyId}:model:monthly:*:${currentMonth}`
 
-    const keys = await client.keys(pattern)
+    const keys = await redis.keys(pattern)
     const modelStats = []
 
     for (const key of keys) {

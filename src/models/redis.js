@@ -54,6 +54,12 @@ class RedisClient {
   constructor() {
     this.client = null
     this.isConnected = false
+    this._concurrencySwitchCache = {
+      mode: 'zset',
+      switchAtMs: 0,
+      freezeUntilMs: 0,
+      loadedAtMs: 0
+    }
   }
 
   async connect() {
@@ -116,6 +122,95 @@ class RedisClient {
     return this.client
   }
 
+  // ===== Concurrency centralized switch (no-mix deployment) =====
+  async _getServerTimeMs() {
+    try {
+      const resp = await this.getClientSafe().time()
+      // ioredis returns [seconds, microseconds]
+      if (Array.isArray(resp) && resp.length >= 2) {
+        const sec = Number(resp[0])
+        const usec = Number(resp[1])
+        if (Number.isFinite(sec) && Number.isFinite(usec)) {
+          return sec * 1000 + Math.floor(usec / 1000)
+        }
+      }
+    } catch (e) {
+      // ignore and fall back
+    }
+    return Date.now()
+  }
+
+  async _loadConcurrencySwitchConfig() {
+    const client = this.getClientSafe()
+    // Use MGET to minimize round-trips
+    const [modeRaw, switchAtRaw, freezeUntilRaw] = await client.mget(
+      'concurrency:mode',
+      'concurrency:switch_at_ms',
+      'concurrency:freeze_until_ms'
+    )
+    const toInt = (v, d = 0) => {
+      const n = Number(v)
+      return Number.isFinite(n) ? n : d
+    }
+    const mode = typeof modeRaw === 'string' && modeRaw.trim() ? modeRaw.trim() : 'zset'
+    const switchAtMs = toInt(switchAtRaw, 0)
+    const freezeUntilMs = toInt(freezeUntilRaw, 0)
+    this._concurrencySwitchCache = {
+      mode,
+      switchAtMs,
+      freezeUntilMs,
+      loadedAtMs: Date.now()
+    }
+    return this._concurrencySwitchCache
+  }
+
+  async getConcurrencySwitchState() {
+    const nowLocal = Date.now()
+    if (
+      !this._concurrencySwitchCache ||
+      nowLocal - (this._concurrencySwitchCache.loadedAtMs || 0) > 1000
+    ) {
+      await this._loadConcurrencySwitchConfig()
+    }
+    // compute runtime mode based on Redis TIME
+    const serverMs = await this._getServerTimeMs()
+    let runtimeMode = 'zset'
+    if (this._concurrencySwitchCache.mode === 'slots') {
+      if (this._concurrencySwitchCache.switchAtMs > 0) {
+        runtimeMode = serverMs >= this._concurrencySwitchCache.switchAtMs ? 'slots' : 'zset'
+      } else {
+        runtimeMode = 'slots'
+      }
+    }
+    const freezeActive =
+      this._concurrencySwitchCache.freezeUntilMs > 0 &&
+      serverMs < this._concurrencySwitchCache.freezeUntilMs
+    return { mode: runtimeMode, freezeActive, serverMs }
+  }
+
+  // 在 Redis 中设置集中并发开关（用于蓝绿切流/启动时配置）
+  async setConcurrencyConfig({ mode, switchAtMs, freezeUntilMs } = {}) {
+    const client = this.getClientSafe()
+    const m = client.multi()
+    if (typeof mode === 'string' && mode.trim()) {
+      m.set('concurrency:mode', mode.trim().toLowerCase())
+    }
+    if (Number.isFinite(switchAtMs) && switchAtMs > 0) {
+      m.set('concurrency:switch_at_ms', String(switchAtMs))
+    } else if (switchAtMs === 0) {
+      m.del('concurrency:switch_at_ms')
+    }
+    if (Number.isFinite(freezeUntilMs) && freezeUntilMs > 0) {
+      m.set('concurrency:freeze_until_ms', String(freezeUntilMs))
+    } else if (freezeUntilMs === 0) {
+      m.del('concurrency:freeze_until_ms')
+    }
+    await m.exec()
+    // 刷新本地缓存
+    await this._loadConcurrencySwitchConfig()
+    return true
+  }
+
   // 🔑 API Key 相关操作
   async setApiKey(keyId, keyData, hashedKey = null) {
     const key = `apikey:${keyId}`
@@ -150,7 +245,7 @@ class RedisClient {
   }
 
   async getAllApiKeys() {
-    const keys = await this.client.keys('apikey:*')
+    const keys = await this.keys('apikey:*')
     const apiKeys = []
     for (const key of keys) {
       // 过滤掉hash_map，它不是真正的API Key
@@ -799,7 +894,7 @@ class RedisClient {
 
     // 获取账户今日所有模型的使用数据
     const pattern = `account_usage:model:daily:${accountId}:*:${today}`
-    const modelKeys = await this.client.keys(pattern)
+    const modelKeys = await this.keys(pattern)
 
     if (!modelKeys || modelKeys.length === 0) {
       return 0
@@ -946,7 +1041,7 @@ class RedisClient {
   async getAllAccountsUsageStats() {
     try {
       // 获取所有Claude账户
-      const accountKeys = await this.client.keys('claude_account:*')
+      const accountKeys = await this.keys('claude_account:*')
       const accountStats = []
 
       for (const accountKey of accountKeys) {
@@ -989,7 +1084,7 @@ class RedisClient {
     try {
       // 获取所有API Key ID
       const apiKeyIds = []
-      const apiKeyKeys = await client.keys('apikey:*')
+      const apiKeyKeys = await this.keys('apikey:*')
 
       for (const key of apiKeyKeys) {
         if (key === 'apikey:hash_map') {
@@ -1009,14 +1104,14 @@ class RedisClient {
         }
 
         // 删除该API Key的每日统计（使用精确的keyId匹配）
-        const dailyKeys = await client.keys(`usage:daily:${keyId}:*`)
+        const dailyKeys = await this.keys(`usage:daily:${keyId}:*`)
         if (dailyKeys.length > 0) {
           await client.del(...dailyKeys)
           stats.deletedDailyKeys += dailyKeys.length
         }
 
         // 删除该API Key的每月统计（使用精确的keyId匹配）
-        const monthlyKeys = await client.keys(`usage:monthly:${keyId}:*`)
+        const monthlyKeys = await this.keys(`usage:monthly:${keyId}:*`)
         if (monthlyKeys.length > 0) {
           await client.del(...monthlyKeys)
           stats.deletedMonthlyKeys += monthlyKeys.length
@@ -1032,7 +1127,7 @@ class RedisClient {
       }
 
       // 额外清理：删除所有可能遗漏的usage相关键
-      const allUsageKeys = await client.keys('usage:*')
+      const allUsageKeys = await this.keys('usage:*')
       if (allUsageKeys.length > 0) {
         await client.del(...allUsageKeys)
         stats.deletedKeys += allUsageKeys.length
@@ -1056,7 +1151,7 @@ class RedisClient {
   }
 
   async getAllClaudeAccounts() {
-    const keys = await this.client.keys('claude:account:*')
+    const keys = await this.keys('claude:account:*')
     const accounts = []
     for (const key of keys) {
       const accountData = await this.client.hgetall(key)
@@ -1084,7 +1179,7 @@ class RedisClient {
   }
 
   async getAllDroidAccounts() {
-    const keys = await this.client.keys('droid:account:*')
+    const keys = await this.keys('droid:account:*')
     const accounts = []
     for (const key of keys) {
       const accountData = await this.client.hgetall(key)
@@ -1114,7 +1209,7 @@ class RedisClient {
   }
 
   async getAllOpenAIAccounts() {
-    const keys = await this.client.keys('openai:account:*')
+    const keys = await this.keys('openai:account:*')
     const accounts = []
     for (const key of keys) {
       const accountData = await this.client.hgetall(key)
@@ -1205,9 +1300,9 @@ class RedisClient {
   // 📈 系统统计
   async getSystemStats() {
     const keys = await Promise.all([
-      this.client.keys('apikey:*'),
-      this.client.keys('claude:account:*'),
-      this.client.keys('usage:*')
+      this.keys('apikey:*'),
+      this.keys('claude:account:*'),
+      this.keys('usage:*')
     ])
 
     return {
@@ -1221,7 +1316,7 @@ class RedisClient {
   async getTodayStats() {
     try {
       const today = getDateStringInTimezone()
-      const dailyKeys = await this.client.keys(`usage:daily:*:${today}`)
+      const dailyKeys = await this.keys(`usage:daily:*:${today}`)
 
       let totalRequestsToday = 0
       let totalTokensToday = 0
@@ -1269,7 +1364,7 @@ class RedisClient {
       }
 
       // 获取今日创建的API Key数量（批量优化）
-      const allApiKeys = await this.client.keys('apikey:*')
+      const allApiKeys = await this.keys('apikey:*')
       let apiKeysCreatedToday = 0
 
       if (allApiKeys.length > 0) {
@@ -1310,7 +1405,7 @@ class RedisClient {
   // 📈 获取系统总的平均RPM和TPM
   async getSystemAverages() {
     try {
-      const allApiKeys = await this.client.keys('apikey:*')
+      const allApiKeys = await this.keys('apikey:*')
       let totalRequests = 0
       let totalTokens = 0
       let totalInputTokens = 0
@@ -1548,7 +1643,7 @@ class RedisClient {
       const patterns = ['usage:daily:*', 'ratelimit:*', 'session:*', 'sticky_session:*', 'oauth:*']
 
       for (const pattern of patterns) {
-        const keys = await this.client.keys(pattern)
+        const keys = await this.keys(pattern)
         const pipeline = this.client.pipeline()
 
         for (const key of keys) {
@@ -1631,37 +1726,61 @@ class RedisClient {
     }
 
     try {
+      const { mode, freezeActive } = await this.getConcurrencySwitchState()
+      if (freezeActive) {
+        // Deny issuing new tokens in freeze window by pretending it's over limit
+        // Return a large number; caller will treat as exceeded and revert
+        return Number.MAX_SAFE_INTEGER
+      }
+
       const { leaseSeconds: defaultLeaseSeconds, cleanupGraceSeconds } =
         this._getConcurrencyConfig()
       const lease = leaseSeconds || defaultLeaseSeconds
-      const key = `concurrency:${apiKeyId}`
-      const now = Date.now()
-      const expireAt = now + lease * 1000
-      const ttl = Math.max((lease + cleanupGraceSeconds) * 1000, 60000)
-
-      const luaScript = `
-        local key = KEYS[1]
-        local member = ARGV[1]
-        local expireAt = tonumber(ARGV[2])
-        local now = tonumber(ARGV[3])
-        local ttl = tonumber(ARGV[4])
-
-        redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
-        redis.call('ZADD', key, expireAt, member)
-
-        if ttl > 0 then
-          redis.call('PEXPIRE', key, ttl)
-        end
-
-        local count = redis.call('ZCARD', key)
+      if (mode === 'slots') {
+        const key = `concurrency:${apiKeyId}:req:${requestId}`
+        const ttl = Math.max((lease + cleanupGraceSeconds) * 1000, 60000)
+        // Acquire by setting per-request key with PX, NX
+        await this.client.set(key, '1', 'PX', ttl, 'NX')
+        // Count current occupancy by scanning req:* keys (bounded rounds)
+        const keys = await this.scanKeys(`concurrency:${apiKeyId}:req:*`, {
+          count: 200,
+          maxRounds: 50
+        })
+        const count = keys.length
+        logger.database(
+          `🔢 [slots] Incremented concurrency for key ${apiKeyId}: ${count} (request ${requestId})`
+        )
         return count
-      `
+      } else {
+        const key = `concurrency:${apiKeyId}`
+        const now = Date.now()
+        const expireAt = now + lease * 1000
+        const ttl = Math.max((lease + cleanupGraceSeconds) * 1000, 60000)
 
-      const count = await this.client.eval(luaScript, 1, key, requestId, expireAt, now, ttl)
-      logger.database(
-        `🔢 Incremented concurrency for key ${apiKeyId}: ${count} (request ${requestId})`
-      )
-      return count
+        const luaScript = `
+          local key = KEYS[1]
+          local member = ARGV[1]
+          local expireAt = tonumber(ARGV[2])
+          local now = tonumber(ARGV[3])
+          local ttl = tonumber(ARGV[4])
+
+          redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
+          redis.call('ZADD', key, expireAt, member)
+
+          if ttl > 0 then
+            redis.call('PEXPIRE', key, ttl)
+          end
+
+          local count = redis.call('ZCARD', key)
+          return count
+        `
+
+        const count = await this.client.eval(luaScript, 1, key, requestId, expireAt, now, ttl)
+        logger.database(
+          `🔢 Incremented concurrency for key ${apiKeyId}: ${count} (request ${requestId})`
+        )
+        return count
+      }
     } catch (error) {
       logger.error('❌ Failed to increment concurrency:', error)
       throw error
@@ -1675,41 +1794,57 @@ class RedisClient {
     }
 
     try {
+      const { mode } = await this.getConcurrencySwitchState()
       const { leaseSeconds: defaultLeaseSeconds, cleanupGraceSeconds } =
         this._getConcurrencyConfig()
       const lease = leaseSeconds || defaultLeaseSeconds
-      const key = `concurrency:${apiKeyId}`
-      const now = Date.now()
-      const expireAt = now + lease * 1000
-      const ttl = Math.max((lease + cleanupGraceSeconds) * 1000, 60000)
-
-      const luaScript = `
-        local key = KEYS[1]
-        local member = ARGV[1]
-        local expireAt = tonumber(ARGV[2])
-        local now = tonumber(ARGV[3])
-        local ttl = tonumber(ARGV[4])
-
-        redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
-
-        local exists = redis.call('ZSCORE', key, member)
-
-        if exists then
-          redis.call('ZADD', key, expireAt, member)
-          if ttl > 0 then
-            redis.call('PEXPIRE', key, ttl)
-          end
+      if (mode === 'slots') {
+        const key = `concurrency:${apiKeyId}:req:${requestId}`
+        const ttl = Math.max((lease + cleanupGraceSeconds) * 1000, 60000)
+        // Extend TTL if key exists
+        const pttl = await this.client.pttl(key)
+        if (pttl && pttl > 0) {
+          await this.client.pexpire(key, ttl)
+          logger.debug(
+            `🔄 [slots] Refreshed concurrency lease for key ${apiKeyId} (request ${requestId})`
+          )
           return 1
-        end
-
+        }
         return 0
-      `
+      } else {
+        const key = `concurrency:${apiKeyId}`
+        const now = Date.now()
+        const expireAt = now + lease * 1000
+        const ttl = Math.max((lease + cleanupGraceSeconds) * 1000, 60000)
 
-      const refreshed = await this.client.eval(luaScript, 1, key, requestId, expireAt, now, ttl)
-      if (refreshed === 1) {
-        logger.debug(`🔄 Refreshed concurrency lease for key ${apiKeyId} (request ${requestId})`)
+        const luaScript = `
+          local key = KEYS[1]
+          local member = ARGV[1]
+          local expireAt = tonumber(ARGV[2])
+          local now = tonumber(ARGV[3])
+          local ttl = tonumber(ARGV[4])
+
+          redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
+
+          local exists = redis.call('ZSCORE', key, member)
+
+          if exists then
+            redis.call('ZADD', key, expireAt, member)
+            if ttl > 0 then
+              redis.call('PEXPIRE', key, ttl)
+            end
+            return 1
+          end
+
+          return 0
+        `
+
+        const refreshed = await this.client.eval(luaScript, 1, key, requestId, expireAt, now, ttl)
+        if (refreshed === 1) {
+          logger.debug(`🔄 Refreshed concurrency lease for key ${apiKeyId} (request ${requestId})`)
+        }
+        return refreshed
       }
-      return refreshed
     } catch (error) {
       logger.error('❌ Failed to refresh concurrency lease:', error)
       return 0
@@ -1719,34 +1854,49 @@ class RedisClient {
   // 减少并发计数
   async decrConcurrency(apiKeyId, requestId) {
     try {
-      const key = `concurrency:${apiKeyId}`
-      const now = Date.now()
-
-      const luaScript = `
-        local key = KEYS[1]
-        local member = ARGV[1]
-        local now = tonumber(ARGV[2])
-
-        if member then
-          redis.call('ZREM', key, member)
-        end
-
-        redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
-
-        local count = redis.call('ZCARD', key)
-        if count <= 0 then
-          redis.call('DEL', key)
-          return 0
-        end
-
+      const { mode } = await this.getConcurrencySwitchState()
+      if (mode === 'slots') {
+        const key = `concurrency:${apiKeyId}:req:${requestId}`
+        await this.client.del(key)
+        const keys = await this.scanKeys(`concurrency:${apiKeyId}:req:*`, {
+          count: 200,
+          maxRounds: 50
+        })
+        const count = keys.length
+        logger.database(
+          `🔢 [slots] Decremented concurrency for key ${apiKeyId}: ${count} (request ${requestId || 'n/a'})`
+        )
         return count
-      `
+      } else {
+        const key = `concurrency:${apiKeyId}`
+        const now = Date.now()
 
-      const count = await this.client.eval(luaScript, 1, key, requestId || '', now)
-      logger.database(
-        `🔢 Decremented concurrency for key ${apiKeyId}: ${count} (request ${requestId || 'n/a'})`
-      )
-      return count
+        const luaScript = `
+          local key = KEYS[1]
+          local member = ARGV[1]
+          local now = tonumber(ARGV[2])
+
+          if member then
+            redis.call('ZREM', key, member)
+          end
+
+          redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
+
+          local count = redis.call('ZCARD', key)
+          if count <= 0 then
+            redis.call('DEL', key)
+            return 0
+          end
+
+          return count
+        `
+
+        const count = await this.client.eval(luaScript, 1, key, requestId || '', now)
+        logger.database(
+          `🔢 Decremented concurrency for key ${apiKeyId}: ${count} (request ${requestId || 'n/a'})`
+        )
+        return count
+      }
     } catch (error) {
       logger.error('❌ Failed to decrement concurrency:', error)
       throw error
@@ -1756,19 +1906,28 @@ class RedisClient {
   // 获取当前并发数
   async getConcurrency(apiKeyId) {
     try {
-      const key = `concurrency:${apiKeyId}`
-      const now = Date.now()
+      const { mode } = await this.getConcurrencySwitchState()
+      if (mode === 'slots') {
+        const keys = await this.scanKeys(`concurrency:${apiKeyId}:req:*`, {
+          count: 200,
+          maxRounds: 50
+        })
+        return keys.length
+      } else {
+        const key = `concurrency:${apiKeyId}`
+        const now = Date.now()
 
-      const luaScript = `
-        local key = KEYS[1]
-        local now = tonumber(ARGV[1])
+        const luaScript = `
+          local key = KEYS[1]
+          local now = tonumber(ARGV[1])
 
-        redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
-        return redis.call('ZCARD', key)
-      `
+          redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
+          return redis.call('ZCARD', key)
+        `
 
-      const count = await this.client.eval(luaScript, 1, key, now)
-      return parseInt(count || 0)
+        const count = await this.client.eval(luaScript, 1, key, now)
+        return parseInt(count || 0)
+      }
     } catch (error) {
       logger.error('❌ Failed to get concurrency:', error)
       return 0
@@ -1828,9 +1987,101 @@ class RedisClient {
     return await client.del(...keys)
   }
 
-  async keys(pattern) {
+  // KEYS replacement: SCAN-based key listing
+  async scanKeys(pattern, { count = 200, maxRounds } = {}) {
     const client = this.getClientSafe()
-    return await client.keys(pattern)
+    let cursor = '0'
+    const results = []
+    let rounds = 0
+    const roundsCap = Number.isFinite(maxRounds) ? maxRounds : config.redis.scanMaxDepth || 50
+    do {
+      const resp = await client.scan(cursor, 'MATCH', pattern, 'COUNT', count)
+      cursor = Array.isArray(resp) ? resp[0] : '0'
+      const keys = Array.isArray(resp) ? resp[1] : []
+      if (keys && keys.length) {
+        results.push(...keys)
+      }
+      rounds += 1
+      if (rounds >= roundsCap) {
+        break
+      }
+    } while (cursor !== '0')
+    return results
+  }
+
+  // Backwards-compatible wrapper: list all matching keys via SCAN
+  async keys(pattern, options = {}) {
+    // By default, attempt to scan all rounds; callers can cap via options.maxRounds
+    return await this.scanKeys(pattern, options)
+  }
+
+  // Single-page SCAN with cursor for admin pagination
+  async scanPage(pattern, { count, cursor } = {}) {
+    const client = this.getClientSafe()
+    const pageSize = Number.isFinite(Number(count))
+      ? Number(count)
+      : config.admin?.defaultPageSize || 10
+    const cur = typeof cursor === 'string' ? cursor : '0'
+    const resp = await client.scan(cur, 'MATCH', pattern, 'COUNT', pageSize)
+    const nextCursor = Array.isArray(resp) ? resp[0] : '0'
+    const keys = Array.isArray(resp) ? resp[1] : []
+    return { keys, nextCursor, hasMore: nextCursor !== '0' }
+  }
+
+  // 并发池分页概览（根据模式自动适配口径）
+  async concurrencyOverviewPage({ count, cursor } = {}) {
+    const { mode } = await this.getConcurrencySwitchState()
+    if (mode === 'slots') {
+      // 聚合 slots 占用键：concurrency:{pool}:req:{requestId}
+      const { keys, nextCursor, hasMore } = await this.scanPage('concurrency:*:req:*', {
+        count,
+        cursor
+      })
+      const itemsMap = new Map()
+      for (const k of keys) {
+        const m = k.match(/^concurrency:(.+?):req:/)
+        if (!m) {
+          continue
+        }
+        const pool = m[1]
+        itemsMap.set(pool, (itemsMap.get(pool) || 0) + 1)
+      }
+      const items = Array.from(itemsMap.entries()).map(([pool, c]) => ({
+        pool,
+        id: pool,
+        count: c,
+        mode: 'slots'
+      }))
+      return { cursor: nextCursor, hasMore, items }
+    }
+
+    // zset 模式：分页扫描池键并清理过期成员后返回 ZCARD
+    const { keys, nextCursor, hasMore } = await this.scanPage('concurrency:*', {
+      count,
+      cursor
+    })
+    // 过滤可能存在的 slots 占用键
+    const poolKeys = keys.filter((k) => !/:req:/.test(k))
+    if (poolKeys.length === 0) {
+      return { cursor: nextCursor, hasMore, items: [] }
+    }
+
+    const now = Date.now()
+    const pipe = this.getClientSafe().pipeline()
+    // 先清理过期项，再获取计数
+    for (const k of poolKeys) {
+      pipe.zremrangebyscore(k, '-inf', now)
+      pipe.zcard(k)
+    }
+    const res = await pipe.exec()
+    const items = []
+    for (let i = 0; i < poolKeys.length; i++) {
+      const pairIdx = 2 * i + 1
+      const [, cnt] = res[pairIdx] || []
+      const pool = poolKeys[i].replace(/^concurrency:/, '')
+      items.push({ pool, id: pool, count: Number(cnt) || 0, mode: 'zset' })
+    }
+    return { cursor: nextCursor, hasMore, items }
   }
 
   // 📊 获取账户会话窗口内的使用统计（包含模型细分）
