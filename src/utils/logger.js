@@ -160,17 +160,19 @@ const createRotateTransport = (filename, level = null) => {
   }
 
   // 监听轮转事件
-  transport.on('rotate', (oldFilename, newFilename) => {
-    console.log(`📦 Log rotated: ${oldFilename} -> ${newFilename}`)
-  })
+  if (process.env.NODE_ENV !== 'test') {
+    transport.on('rotate', (oldFilename, newFilename) => {
+      console.log(`📦 Log rotated: ${oldFilename} -> ${newFilename}`)
+    })
 
-  transport.on('new', (newFilename) => {
-    console.log(`📄 New log file created: ${newFilename}`)
-  })
+    transport.on('new', (newFilename) => {
+      console.log(`📄 New log file created: ${newFilename}`)
+    })
 
-  transport.on('archive', (zipFilename) => {
-    console.log(`🗜️ Log archived: ${zipFilename}`)
-  })
+    transport.on('archive', (zipFilename) => {
+      console.log(`🗜️ Log archived: ${zipFilename}`)
+    })
+  }
 
   return transport
 }
