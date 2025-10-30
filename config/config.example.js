@@ -44,7 +44,10 @@ const config = {
     retryDelayOnFailover: 100,
     maxRetriesPerRequest: 3,
     lazyConnect: true,
-    enableTLS: process.env.REDIS_ENABLE_TLS === 'true'
+    enableTLS: process.env.REDIS_ENABLE_TLS === 'true',
+    // 非阻塞键遍历设置：用于以 SCAN 替代 KEYS
+    // 最大遍历深度按 SCAN 轮次计，默认 50 轮（用于限制单请求扫描预算）
+    scanMaxDepth: parseInt(process.env.REDIS_SCAN_MAX_DEPTH) || 50
   },
 
   // 🔗 会话管理配置
@@ -128,6 +131,12 @@ const config = {
     sessionSecret: process.env.WEB_SESSION_SECRET || 'CHANGE-THIS-SESSION-SECRET'
   },
 
+  // 🛠️ 管理端配置
+  admin: {
+    // 默认分页大小（管理端列表/搜索接口）
+    defaultPageSize: parseInt(process.env.ADMIN_DEFAULT_PAGE_SIZE) || 10
+  },
+
   // 🔐 LDAP 认证配置
   ldap: {
     enabled: process.env.LDAP_ENABLED === 'true',
@@ -194,6 +203,18 @@ const config = {
   development: {
     debug: process.env.DEBUG === 'true',
     hotReload: process.env.HOT_RELOAD === 'true'
+  },
+
+  // ⚙️ 并发控制（模式切换）
+  concurrency: {
+    // 启动时是否应用下面的配置到 Redis 集中键（建议仅在蓝绿切流时开启）
+    applyOnStartup: process.env.CONCURRENCY_APPLY_ON_STARTUP === 'true',
+    // 期望模式：'zset' 或 'slots'（不区分大小写，内部使用小写）
+    defaultMode: (process.env.CONCURRENCY_DEFAULT_MODE || 'slots').toLowerCase(),
+    // 统一生效时刻（毫秒时间戳）。>0 时写入 concurrency:switch_at_ms；=0 时清除该键
+    switchAtMs: parseInt(process.env.CONCURRENCY_SWITCH_AT_MS) || 0,
+    // 冻结窗口截止（毫秒时间戳）。>0 时写入 concurrency:freeze_until_ms；=0 时清除该键
+    freezeUntilMs: parseInt(process.env.CONCURRENCY_FREEZE_UNTIL_MS) || 0
   }
 }
 
