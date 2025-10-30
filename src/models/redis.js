@@ -2011,8 +2011,15 @@ class RedisClient {
 
   // Backwards-compatible wrapper: list all matching keys via SCAN
   async keys(pattern, options = {}) {
-    // By default, attempt to scan all rounds; callers can cap via options.maxRounds
-    return await this.scanKeys(pattern, options)
+    // For critical enumerations (accounts, api keys, etc.), callers historically
+    // expected KEYS-like completeness. Default to a very large maxRounds so we
+    // iterate until the cursor naturally returns to '0'. Callers can still cap
+    // via options.maxRounds when partial scans are desired (e.g., admin pages).
+    const hasCustomCap = Object.prototype.hasOwnProperty.call(options || {}, 'maxRounds')
+    const effectiveOptions = hasCustomCap
+      ? options
+      : { ...options, maxRounds: Number.MAX_SAFE_INTEGER }
+    return await this.scanKeys(pattern, effectiveOptions)
   }
 
   // Single-page SCAN with cursor for admin pagination
