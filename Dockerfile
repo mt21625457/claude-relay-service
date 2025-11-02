@@ -17,7 +17,7 @@ COPY web/admin-spa/ ./
 RUN npm run build
 
 # 🐳 主应用阶段
-FROM node:18-alpine
+FROM node:24-alpine
 
 # 📋 设置标签
 LABEL maintainer="claude-relay-service@example.com"
@@ -56,7 +56,7 @@ RUN mkdir -p logs data temp
 
 # 🔧 预先创建配置文件
 RUN if [ ! -f "/app/config/config.js" ] && [ -f "/app/config/config.example.js" ]; then \
-        cp /app/config/config.example.js /app/config/config.js; \
+    cp /app/config/config.example.js /app/config/config.js; \
     fi
 
 # 🌐 暴露端口
