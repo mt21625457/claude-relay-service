@@ -1,5 +1,5 @@
 # 🎯 前端构建阶段
-FROM node:18-alpine AS frontend-builder
+FROM node:24-alpine AS frontend-builder
 
 # 📁 设置工作目录
 WORKDIR /app/web/admin-spa
