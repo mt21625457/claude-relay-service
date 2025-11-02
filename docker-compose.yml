@@ -44,8 +44,8 @@ services:
       - API_KEY_PREFIX=${API_KEY_PREFIX:-cr_}
       
       # 👤 管理员凭据（可选）
-      - ADMIN_USERNAME=${ADMIN_USERNAME:-}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-cr_admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-cr_admin@123!}
       
       # 📊 Redis 配置
       - REDIS_HOST=redis
@@ -98,7 +98,7 @@ services:
 
   # 📊 Redis Database
   redis:
-    image: redis:7-alpine
+    image: redis:latest
     restart: unless-stopped
     # 仅在容器网络内部暴露端口，不映射到主机
     expose:
