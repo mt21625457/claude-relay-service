@@ -16,9 +16,7 @@ services:
     restart: unless-stopped
     ports:
       # 绑定地址：生产环境建议使用反向代理，设置 BIND_HOST=127.0.0.1
-      - "${BIND_HOST:-0.0.0.0}:${PORT:-3000}:3000"
-      # 🔒 HTTPS 端口 (可选，启用独立 HTTPS 时使用)
-      - "${BIND_HOST:-0.0.0.0}:${HTTPS_PORT:-3443}:3443"
+      - "${BIND_HOST:-0.0.0.0}:${PORT:-9699}:3000"
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
